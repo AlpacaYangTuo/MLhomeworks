@@ -1,12 +1,37 @@
 import copy
+import random
 import pdb
+
 
 import clip
 import torch
 import torch.nn as nn
 
+from tqdm import tqdm
+from torch.utils.data import DataLoader
 from  .finetune import Finetune
 from .ocm import kwargs
+
+def shrink_cov(cov):
+    diag_mean = torch.mean(torch.diagonal(cov))
+    off_diag = cov.clone()
+    off_diag.fill_diagonal_(0.0)
+    mask = off_diag != 0.0
+    off_diag_mean = (off_diag*mask).sum() / mask.sum()
+    iden = torch.eye(cov.shape[0], device=cov.device)
+    alpha1 = 1
+    alpha2 = 1
+    cov_ = cov + (alpha1 * diag_mean * iden) + (alpha2 * off_diag_mean * (1 - iden))
+    return cov_
+
+def sample(mean, cov, size, shrink=False):
+    vec = torch.randn(size, mean.shape[-1], device=mean.device)
+    if shrink:
+        cov = shrink_cov(cov)
+    sqrt_cov = torch.linalg.cholesky(cov)
+    vec = vec @ sqrt_cov.t()
+    vec = vec + mean
+    return vec
 
 def get_class_ids_per_task(args):
     yield args.class_order[:args.initial_increment]
@@ -54,6 +79,9 @@ class ClassIncrementalCLIP(Finetune):
         self.class_edge_distance = []
         self.mix_b = kwargs['cfg'].mix_bias
 
+        #some trials
+        self.batch_idx = 0
+
     def encode_text(self, text, prompt=False):
         x = self.token_embedding(text).type(self.clip_type)  # [batch_size, n_ctx, d_model]
         x = x + self.positional_embedding.type(self.clip_type)
@@ -77,7 +105,6 @@ class ClassIncrementalCLIP(Finetune):
         return class_name_features.type(torch.float32)
 
     def forward(self, image, ori_ima_f=False, memory_data=None, not_ini=False, edge_sample=None, prompt=False):
-        #wtf???
         image = image.type(torch.float16)
         with torch.no_grad():
             text_features = self.encode_text(self.text_tokens)
@@ -128,6 +155,7 @@ class ClassIncrementalCLIP(Finetune):
         self.class_name_features = self.class_name_features / self.class_name_features.norm(dim=-1, p=2, keepdim=True)
         self.queue_empty = True
         self.hard_pairs = None
+        self.task_idx = task_idx
         if task_idx > 0:
             self.old_adapter = copy.deepcopy(self.adapter)
             dist_list = []
@@ -146,6 +174,12 @@ class ClassIncrementalCLIP(Finetune):
             self.hard_pairs = indices
             self.hard_pairs[:, 1] = self.hard_pairs[:, 1] + self.cfg.initial_increment + (
                         task_idx - 1) * self.cfg.increment
+
+        if task_idx > 0:
+            random_class_order_list = list(range(self.cfg.initial_increment + (task_idx - 1) * self.cfg.increment))
+            random.shuffle(random_class_order_list)
+            self.random_class_order_list = random_class_order_list
+        self.batch_idx = -1
 
     def get_old_edge_samples(self, batch_size):
         random_select = torch.randperm(self.old_edge_samples.shape[0])[:batch_size]
@@ -168,9 +202,76 @@ class ClassIncrementalCLIP(Finetune):
             self.class_cov_list.append(cov)
 
     def observe(self, data):
-        #to be done
+        self.batch_idx += 1
+        inputs, targets = data['image'], data['label']
 
-    def get_parameters(self, config): #it was mix_matrix
+        if self.task_idx > 0:
+            sg_inputs = []
+            sg_targets = []
+            # num of classes per batch. Ensure an epoch traverses all classes at least once.
+            # For exemple, if there are 100 classes and 50 batches per epoch , there will be 2 classes per batch.
+            if self.cfg.dataset == "cifar100" and self.cfg.increment == 5:
+                list_for_one_batch = [self.random_class_order_list[self.batch_idx * 4 % len(self.random_class_order_list)],
+                                      self.random_class_order_list[(self.batch_idx * 4 + 1) % len(self.random_class_order_list)],
+                                      self.random_class_order_list[(self.batch_idx * 4 + 2) % len(self.random_class_order_list)],
+                                      self.random_class_order_list[(self.batch_idx * 4 + 3) % len(self.random_class_order_list)]]
+            elif self.cfg.dataset == "imagenet_R":
+                list_for_one_batch = [self.random_class_order_list[self.batch_idx * 5 % len(self.random_class_order_list)],
+                                      self.random_class_order_list[(self.batch_idx * 5 + 1) % len(self.random_class_order_list)],
+                                      self.random_class_order_list[(self.batch_idx * 5 + 2) % len(self.random_class_order_list)],
+                                      self.random_class_order_list[(self.batch_idx * 5 + 3) % len(self.random_class_order_list)],
+                                      self.random_class_order_list[(self.batch_idx * 5 + 4) % len(self.random_class_order_list)]]
+            else:
+                list_for_one_batch = [self.random_class_order_list[self.batch_idx * 2 % len(self.random_class_order_list)],
+                                      self.random_class_order_list[(self.batch_idx * 2 + 1) % len(self.random_class_order_list)]]
+            for i in list_for_one_batch:
+                sg_inputs.append(
+                    sample(self.class_mean_list[i], self.class_cov_list[i], int(10 * self.cfg.beta), shrink=self.cfg.shrinkage))
+                sg_targets.append(torch.ones(int(10 * self.cfg.beta), dtype=torch.long, device=self.device) * i)
+            sg_inputs = torch.cat(sg_inputs, dim=0)
+            sg_targets = torch.cat(sg_targets, dim=0)
+            targets = torch.cat([targets, sg_targets], dim=0)
+
+        if self.hard_pairs is not None and self.hard_pairs.shape[0] > 0:
+            edge_sample = []
+            edge_p_target = []
+            edge_n_target = []
+            for hard_pair in self.hard_pairs:
+                edge_sample.append(
+                    sample(self.class_mean_list[hard_pair[0]], self.class_cov_list[hard_pair[0]], int(20 * self.cfg.beta),
+                           shrink=self.cfg.shrinkage))
+                edge_p_target.append(torch.ones(int(20 * self.cfg.beta), dtype=torch.long, device=self.device) * hard_pair[0])
+                edge_n_target.append(torch.ones(int(20 * self.cfg.beta), dtype=torch.long, device=self.device) * hard_pair[1])
+            edge_sample = torch.cat(edge_sample, dim=0)
+            edge_p_target = torch.cat(edge_p_target, dim=0)
+            edge_n_target = torch.cat(edge_n_target, dim=0)
+        if self.task_idx > 0:
+            not_ini = True
+        else:
+            not_ini = False
+
+        outputs, _, __, edge_sample_features = self.forward(inputs, memory_data=sg_inputs, not_ini=not_ini,
+                                                     edge_sample=edge_sample, prompt=False)
+        pred = torch.argmax(outputs, dim=1)
+        acc = torch.sum(pred == targets).item()
+
+        if self.task_idx > 0:
+            if edge_sample is not None:
+                edge_sample_features = edge_sample_features / edge_sample_features.norm(dim=-1, keepdim=True)
+                edge_target_features = self.class_name_features[edge_p_target].type(edge_sample_features.dtype)
+                edge_target_features = edge_target_features / edge_target_features.norm(dim=-1, keepdim=True)
+                edge_nearest_class_features = self.class_name_features[edge_n_target].type(edge_sample_features.dtype)
+                edge_nearest_class_features = edge_nearest_class_features / edge_nearest_class_features.norm(dim=-1,
+                                                                                                             keepdim=True)
+                loss_hinge = torch.relu(- (edge_sample_features * edge_target_features.clone().detach()).sum(-1) + (
+                            edge_sample_features * edge_nearest_class_features.clone().detach()).sum(-1) + 0.1).mean()
+        loss_c = torch.nn.functional.cross_entropy(outputs, targets.detach())
+        if edge_sample is not None:
+            return pred, acc, loss_c + loss_hinge
+        else:
+            return pred, acc, loss_c
+
+    def mix_matrix(self):
         if self.old_adapter is not None:
             weight_new = self.adapter.weight.data
             weight_old = self.old_adapter.weight.data
@@ -184,4 +285,23 @@ class ClassIncrementalCLIP(Finetune):
             right = P_new * mask + torch.diag(S_old) @ V_old * (1 - mask)
             weight = U_old @ right
             self.adapter.weight.data = weight
-            return weight
+            return
+
+    def after_task(self, task_idx, buffer, train_loader, test_loaders):
+        sample_loader = DataLoader(train_loader, batch_size=128, shuffle=False, num_workers=self.cfg.num_workers)
+        sample_data = []
+        sample_target = []
+        sample_after_adapt_feature = []
+        print('analyze')
+        for input, target, task_ids in tqdm(sample_loader):
+            input, target = input.to(self.device), target.to(self.device)
+            with torch.no_grad():
+                _, ori_ima_feat, after_adapt_feature = self.forward(input, ori_ima_f=True)
+            sample_data.append(ori_ima_feat)
+            sample_target.append(target)
+            sample_after_adapt_feature.append(after_adapt_feature)
+        sample_target = torch.cat(sample_target, dim=0)
+        sample_data = torch.cat(sample_data, dim=0)
+        sample_after_adapt_feature = torch.cat(sample_after_adapt_feature, dim=0)
+        self.analyze_mean_cov(sample_data, sample_target)
+        self.mix_matrix()
